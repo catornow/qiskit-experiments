@@ -15,13 +15,18 @@
 from abc import abstractmethod
 from enum import Enum
 from numbers import Number
-from typing import List, Union, Sequence
+from typing import List, Union, Sequence, Any, Dict, Tuple
 
 import numpy as np
 from uncertainties import unumpy as unp, ufloat
 
 from qiskit_experiments.data_processing.data_action import DataAction, TrainableDataAction
 from qiskit_experiments.data_processing.exceptions import DataProcessorError
+
+from abc import ABC
+from collections import defaultdict
+
+from qiskit.result.postprocess import format_counts_memory
 
 
 class AverageData(DataAction):
@@ -581,3 +586,144 @@ class ProjectorType(Enum):
     ABS = ToAbs
     REAL = ToReal
     IMAG = ToImag
+
+
+class RestlessNode(DataAction, ABC):
+    """An abstract node for restless data processing nodes.
+
+    In restless measurements, the qubit is not reset after each measurement. Instead, the
+    outcome of the previous quantum non-demolition measurement is the initial state for the
+    current circuit. Restless measurements therefore require special data processing nodes
+    that are implemented as sub-classes of `ResltessNode`.
+    """
+
+    def __init__(self, validate: bool = True):
+        """Initialize a restless node.
+
+        Args:
+            validate: If set to True the node will validate its input.
+        """
+        super().__init__(validate)
+        self._n_shots = None
+        self._n_circuits = None
+
+    def _format_data(self, data: Any) -> Any:
+        """Convert the data to an array.
+
+        This node will also set all the attributes needed to process the data such as
+        the number of shots and the number of circuits.
+
+        Args:
+            data: An array representing the memory.
+        """
+
+        self._n_shots = len(data[0])
+        self._n_circuits = len(data)
+
+        datum = np.array(data)
+
+        if self._validate:
+            if datum.shape != (self._n_circuits, self._n_shots):
+                raise DataProcessorError(
+                    f"The datum given to {self.__class__.__name__} does not convert "
+                    "of an array with dimension (number of circuit, number of shots)."
+                )
+
+        return data
+
+    def _reorder(self, unordered_data: np.array) -> np.array:
+        """Reorder the measured data according to the measurement sequence.
+
+        Here, is assumed that the inner loop of the measurement is done over the circuits
+        and the outer loop is done over the shots.
+        """
+        if unordered_data is None:
+            return unordered_data
+
+        order_data = []
+
+        for shot_idx in range(self._n_shots):
+            for circuit_idx in range(self._n_circuits):
+                order_data.append(unordered_data[circuit_idx][shot_idx])
+
+        return np.array(order_data)
+
+
+class RestlessQPTNode(RestlessNode):
+    """A node dedicated for restless measurements.
+
+    This node will take a datum and return the counts for each circuit but split up
+    according to the initial restless state. Therefore, if the data has n qubits and
+    there are m circuits then the processed data will have 2**n * m circuits. For
+    example, suppose that there is one qubit and two circuits with the memory
+
+    .. parsed-literal::
+
+        circ0_memory = ["0x0", "0x1", "0x1", "0x0"]
+        circ1_memory = ["0x1", "0x1", "0x1", "0x0"]
+
+    then this node will return four dictionaries of counts which corresponds to
+    two circuits times two restless state (2 ** n_qubits). In the example above the
+    ordered memory will be ["0x0", "0x1", "0x1", "0x1", "0x1", "0x1", "0x0", "0x0"].
+    Therefore the returned counts will be
+
+    .. parsed-literal::
+
+        [
+            # Restless initial state "0", i.e. previous memory outcome was "0"
+            [
+                {"0": 1, "1": 0},  # circ0
+                {"0": 1, "1": 1}   # circ1
+            ],
+
+            # Restless initial state "1", i.e. previous memory outcome was "1"
+            [
+                {"0": 1, "1": 2},  # circ0
+                {"0": 0, "1": 2}   # circ1
+            ]
+        ]
+    """
+
+    def __init__(self, n_qubits: int, header: Dict[str, Any], validate: bool = True):
+        """Initialize the restless QPT node.
+
+        Args:
+            header: The header needed by :code:`qiskit.result.postprocess.format_counts_memory`
+                to convert the memory into a bit-string of counts. For example,
+                :code:`{"memory_slots": 1}` for a single qubit.
+        """
+        super().__init__(validate)
+        self._n_qubits = n_qubits
+        self._header = header
+
+    def _process(self, datum: Any) -> np.array:
+        """This node takes as input the datum and """
+
+        # Step 1. Order the data to gate the previous shots.
+        memory = self._reorder(datum)
+
+        # Step 2. Setup the data container
+        all_counts = []
+        for _ in range(2 ** self._n_qubits):
+            all_counts.append([{"counts": defaultdict(int)} for _ in range(self._n_circuits)])
+
+        # Step 3. Count the shots.
+        prev_shot = "0" * self._n_qubits
+        for memory_idx, shot in enumerate(memory):
+            shot = format_counts_memory(shot, self._header)
+            restless_state_idx = int(prev_shot, 2)
+
+            circ_idx = memory_idx % self._n_circuits
+
+            all_counts[restless_state_idx][circ_idx]["counts"][shot] += 1
+
+            prev_shot = shot
+
+        # Step 4. Convert to dict.
+        counts = []
+        for restless_state in all_counts:
+            counts.append([])
+            for circuit_counts in restless_state:
+                counts[-1].append({"counts": dict(circuit_counts["counts"])})
+
+        return np.array(counts)
